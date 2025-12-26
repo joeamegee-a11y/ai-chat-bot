@@ -1,0 +1,235 @@
+require("dotenv").config();
+const { Telegraf, Markup } = require("telegraf");
+const { MongoClient } = require("mongodb");
+
+// ======================
+// ⚡ Initialisation
+// ======================
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const client = new MongoClient(process.env.MONGO_URI);
+const LOG_CHAT_ID = process.env.LOG_CHAT_ID; // Chat ID pour les logs admin
+
+(async () => {
+  try {
+    await client.connect();
+    console.log("✔️ Connecté à MongoDB");
+
+    const db = client.db("telegram_bot");
+    const warns = db.collection("warnings");
+    const messages = db.collection("messages");
+    const accepted = db.collection("accepted_rules");
+
+    // ======================
+    // 📝 Fonction log admin
+    // ======================
+    async function logAdmin(text) {
+      try {
+        await bot.telegram.sendMessage(LOG_CHAT_ID, `📝 LOG:\n${text}`);
+      } catch (e) {
+        console.log("⚠️ Erreur LOG :", e);
+      }
+    }
+
+    // ======================
+    // 🧹 Nettoyage automatique des logs (50 derniers)
+    // ======================
+    async function cleanLogs() {
+      // Si tu veux gérer les logs, fais-le depuis MongoDB
+      const count = await messages.countDocuments();
+      if (count > 50) {
+        const toDelete = await messages.find().sort({ date: 1 }).limit(count - 50).toArray();
+        const ids = toDelete.map(m => m._id);
+        await messages.deleteMany({ _id: { $in: ids } });
+        console.log("🧹 Logs MongoDB nettoyés");
+      }
+    }
+    setInterval(cleanLogs, 30 * 60 * 1000); // toutes les 30 min
+
+    // ======================
+    // 🚨 Nouveau membre / Règles / Acceptation
+    // ======================
+    bot.on("new_chat_members", async (ctx) => {
+      const user = ctx.message.new_chat_members[0];
+      const chatId = ctx.chat.id;
+
+      if (user.is_bot) return;
+
+      // Bloquer le membre (lecture seule)
+      await ctx.restrictChatMember(user.id, {
+        permissions: {
+          can_send_messages: false,
+          can_send_media_messages: false,
+          can_send_other_messages: false,
+          can_add_web_page_previews: false
+        }
+      });
+
+      // Enregistrer en DB (non accepté)
+      await accepted.updateOne(
+        { userId: user.id, chatId },
+        { $set: { userId: user.id, chatId, accepted: false } },
+        { upsert: true }
+      );
+
+      await ctx.reply(
+`👋 Bienvenue **${user.first_name}** !
+Avant de parler, tu dois accepter les règles du groupe.`,
+        {
+          parse_mode: "Markdown",
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback("✅ J’accepte les règles", `accept_${user.id}`)],
+            [Markup.button.url("📜 Voir les règles", "https://t.me/ton_groupe")]
+          ])
+        }
+      );
+
+      logAdmin(`🛑 Nouveau membre en attente : ${user.first_name} (${user.id})`);
+    });
+
+    // ======================
+    // ✅ Bouton Accept
+    // ======================
+    bot.action(/accept_\d+/, async (ctx) => {
+      const userId = Number(ctx.callbackQuery.data.split("_")[1]);
+      const chatId = ctx.chat.id;
+
+      if (ctx.from.id !== userId) {
+        return ctx.answerCbQuery("❌ Ce bouton n’est pas pour toi.");
+      }
+
+      // Update DB
+      await accepted.updateOne(
+        { userId, chatId },
+        { $set: { accepted: true } },
+        { upsert: true }
+      );
+
+      // Autoriser à parler
+      await ctx.restrictChatMember(userId, {
+        permissions: {
+          can_send_messages: true,
+          can_send_media_messages: true,
+          can_send_other_messages: true,
+          can_add_web_page_previews: true
+        }
+      });
+
+      await ctx.editMessageText("🎉 Tu as accepté les règles, bienvenue !");
+      await ctx.answerCbQuery("Accès accordé 👍");
+
+      logAdmin(`✔️ Règles acceptées : ${ctx.from.first_name} (${userId})`);
+    });
+
+    // ======================
+    // 🛡️ Blocage messages si non accepté
+    // ======================
+    bot.use(async (ctx, next) => {
+      if (!ctx.message || !ctx.from || !ctx.chat) return next();
+
+      const userId = ctx.from.id;
+      const chatId = ctx.chat.id;
+
+      // Ignorer admins
+      const member = await ctx.telegram.getChatMember(chatId, userId);
+      if (["administrator", "creator"].includes(member.status)) return next();
+
+      const ruleOK = await accepted.findOne({ userId, chatId, accepted: true });
+      if (!ruleOK) {
+        try { await ctx.deleteMessage(); } catch {}
+        return;
+      }
+
+      next();
+    });
+
+    // ======================
+    // ❌ Anti-spam / Anti-link
+    // ======================
+    bot.on("message", async (ctx, next) => {
+      const user = ctx.from;
+      const chatId = ctx.chat.id;
+      const text = (ctx.message.text || "").toLowerCase();
+
+      // Anti-link
+      const linkPatterns = ["http://", "https://", "t.me/", "www."];
+      if (linkPatterns.some(x => text.includes(x))) {
+        await ctx.deleteMessage();
+        let W = await warns.findOne({ userId: user.id, chatId });
+        if (!W) W = { userId: user.id, chatId, warns: 0 };
+        W.warns++;
+        await warns.updateOne({ userId: user.id, chatId }, { $set: W }, { upsert: true });
+        logAdmin(`⚠️ Lien supprimé : ${user.first_name} warn ${W.warns}/3`);
+        if (W.warns >= 3) {
+          await ctx.telegram.banChatMember(chatId, user.id);
+          await warns.deleteOne({ userId: user.id, chatId });
+          ctx.reply(`🚫 ${user.first_name} banni (3 warns - liens)`);
+          logAdmin(`🚫 BAN : ${user.first_name} (3 warns - liens)`);
+        } else {
+          ctx.reply(`⚠️ @${user.username || user.first_name} warn ${W.warns}/3 — **Liens interdits**`);
+        }
+        return;
+      }
+
+      // Anti-spam
+      await messages.insertOne({
+        userId: user.id,
+        chatId,
+        text: ctx.message.text || "",
+        date: Date.now(),
+      });
+
+      const recent = await messages
+        .find({ userId: user.id, date: { $gt: Date.now() - 10000 } })
+        .toArray();
+
+      const spamPatterns = ["porn", "sex", "crypto", "promo", "airdrop", "earn money", "hentai", "free money"];
+      const isSpam = spamPatterns.some(p => text.includes(p));
+
+      if (recent.length >= 5 || isSpam) {
+        await ctx.deleteMessage();
+        logAdmin(`🗑️ Spam supprimé : ${user.first_name} — ${text}`);
+
+        let W = await warns.findOne({ userId: user.id, chatId });
+        if (!W) W = { userId: user.id, chatId, warns: 0 };
+        W.warns++;
+        await warns.updateOne({ userId: user.id, chatId }, { $set: W }, { upsert: true });
+
+        if (W.warns >= 3) {
+          await ctx.telegram.banChatMember(chatId, user.id);
+          await warns.deleteOne({ userId: user.id, chatId });
+          ctx.reply(`🚫 ${user.first_name} banni (3 warns spam)`);
+        } else {
+          ctx.reply(`⚠️ Warn ${W.warns}/3 pour spam`);
+        }
+      }
+
+      next();
+    });
+
+    // ======================
+    // 📜 Commande /regles
+    // ======================
+    bot.command("regles", async (ctx) => {
+      await ctx.replyWithMarkdown(`
+📜 **RÈGLES DU GROUPE**
+
+1️⃣ Pas de spam ni flood  
+2️⃣ Pas de liens (pub, arnaques, t.me, sites douteux)  
+3️⃣ Pas d'insultes / manque de respect  
+4️⃣ Pas de contenu porno, gore, haineux  
+5️⃣ Pas de vente, crypto, airdrop, arnaques  
+6️⃣ Restez courtois, entraidez-vous 👍  
+
+⚠️ Le non-respect des règles = warn → bannissement automatique.
+      `);
+    });
+
+    // ======================
+    // 🚀 Lancement du bot
+    // ======================
+    bot.launch();
+    console.log("🚀 BOT FULL SECURITY ACTIVÉ");
+  } catch (err) {
+    console.error("❌ Erreur MongoDB :", err);
+  }
+})();
